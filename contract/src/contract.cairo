@@ -35,6 +35,7 @@ mod ZkAuction {
         finish_at: u64,
     }
 
+    // TODO: Need to add NFT related logic, for which users auction
     #[constructor]
     fn constructor(ref self: ContractState, min_bid: u32, max_bid: u32, duration: u64) {
         assert(min_bid < max_bid, super::errors::BID_ORDER);
