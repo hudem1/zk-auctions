@@ -4,8 +4,10 @@ use starknet::ContractAddress;
 pub trait IZkAuction<TContractState> {
     fn commit_bid(ref self: TContractState, bid_proof: Span<felt252>, bid_hash: felt252);
     fn reveal_bid(ref self: TContractState, bid_amount: u32, user_salt: felt252);
-    fn reward_winner(ref self: TContractState) -> (Option<ContractAddress>, u32);
+    fn reward_winner(ref self: TContractState) -> (ContractAddress, u32);
     fn withdraw_funds(ref self: TContractState);
+    fn get_min_bid(self: @TContractState) -> u32;
+    fn get_max_bid(self: @TContractState) -> u32;
 }
 
 #[starknet::interface]
@@ -13,6 +15,12 @@ trait IGroth16VerifierBN254<TContractState> {
     fn verify_groth16_proof_bn254(
         self: @TContractState, full_proof_with_hints: Span<felt252>,
     ) -> Option<Span<u256>>;
+}
+
+#[starknet::interface]
+trait IStrkErc20Token<TContractState> {
+    fn transfer(ref self: TContractState, recipient: ContractAddress, amount: u256) -> bool;
+    fn transfer_from(ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256) -> bool;
 }
 
 mod errors {
@@ -26,18 +34,25 @@ mod errors {
     pub const REVEAL_ONGOING: felt252 = 'Reveal phase is still on going';
     pub const NO_WINNER: felt252 = 'No winner';
     pub const WINNER_ALREADY_REWARDED: felt252 = 'Winner already been rewarded';
+    pub const BID_ALREADY_REVEALED: felt252 = 'Already revealed bid';
+
+    /// WITHDRAWAL NOT ALLOWED
+    pub const WITHDRAWAL_TIME_NOT_REACHED: felt252 = 'Withdrawal time not yet reached';
+    pub const NOT_BIDDER: felt252 = 'User has not placed a bid';
+    pub const HAS_REVEALED: felt252 = 'User has revealed their bid';
+    pub const ALREADY_WITHDRAWN: felt252 = 'User has already withdrawn';
 }
 
 #[starknet::contract]
 mod ZkAuction {
-    use super::IGroth16VerifierBN254DispatcherTrait;
-    use super::{IGroth16VerifierBN254Dispatcher};
-    use core::hash::HashStateExTrait;
-    use core::hash::HashStateTrait;
-    use starknet::storage::StoragePathEntry;
-    use starknet::{ContractAddress, get_caller_address, get_block_timestamp};
+    use super::{
+        IGroth16VerifierBN254Dispatcher, IGroth16VerifierBN254DispatcherTrait,
+        IStrkErc20TokenDispatcher, IStrkErc20TokenDispatcherTrait
+    };
+    use core::hash::{HashStateTrait, HashStateExTrait};
+    use starknet::{ContractAddress, get_caller_address, get_contract_address, get_block_timestamp, contract_address_const};
     use core::poseidon::PoseidonTrait;
-    use starknet::storage::{Map, StoragePointerReadAccess, StoragePointerWriteAccess};
+    use starknet::storage::{Map, Vec, MutableVecTrait, StoragePointerReadAccess, StoragePointerWriteAccess, StoragePathEntry};
     use openzeppelin_token::erc721::{ERC721Component, ERC721HooksEmptyImpl};
     use openzeppelin_introspection::src5::SRC5Component;
 
@@ -49,6 +64,10 @@ mod ZkAuction {
 
     impl ERC721InternalImpl = ERC721Component::InternalImpl<ContractState>;
 
+    const STRK_ERC20_ADDRESS: felt252 = 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d;
+    // Time to wait (in seconds) before being able to withdraw locked minimal bid
+    const WITHDRAWAL_TIME: u64 = 7776000;
+
     #[storage]
     struct Storage {
         #[substorage(v0)]
@@ -59,9 +78,19 @@ mod ZkAuction {
 
         verifier_contract: IGroth16VerifierBN254Dispatcher,
 
+        strk_erc20_contract: IStrkErc20TokenDispatcher,
+
         min_bid: u32,
         max_bid: u32,
         commitments: Map<ContractAddress, felt252>, // Maps user addresses to their commitments
+
+        // To make sure users can reveal and therefore be added to `revealers` only once
+        has_revealed: Map<ContractAddress, bool>,
+        revealers: Vec<ContractAddress>,
+
+        // To make sure bidders (that have not revealed) can withdraw only once
+        has_withdrawn: Map<ContractAddress, bool>,
+
         bid_finishes_at: u64,
         reveal_finishes_at: u64,
         highest_bid: u32,
@@ -69,6 +98,8 @@ mod ZkAuction {
         winner_already_rewarded: bool,
     }
 
+    // TODO: add events
+    // TODO: add fct doc + clean code
     #[event]
     #[derive(Drop, starknet::Event)]
     enum Event {
@@ -84,7 +115,7 @@ mod ZkAuction {
         erc721_name: ByteArray,
         erc721_symbol: ByteArray,
         erc721_base_uri: ByteArray,
-        verifier_contract: IGroth16VerifierBN254Dispatcher,
+        verifier_contract_address: ContractAddress,
         min_bid: u32,
         max_bid: u32,
         bid_duration: u64,
@@ -92,7 +123,15 @@ mod ZkAuction {
     ) {
         self.erc721.initializer(erc721_name, erc721_symbol, erc721_base_uri);
 
-        assert(min_bid < max_bid, super::errors::BID_ORDER);
+        self.verifier_contract.write(IGroth16VerifierBN254Dispatcher {
+            contract_address: verifier_contract_address
+        });
+
+        self.strk_erc20_contract.write(IStrkErc20TokenDispatcher {
+            contract_address: contract_address_const::<STRK_ERC20_ADDRESS>()
+        });
+
+        assert(min_bid <= max_bid, super::errors::BID_ORDER);
 
         self.min_bid.write(min_bid);
         self.max_bid.write(max_bid);
@@ -122,14 +161,18 @@ mod ZkAuction {
             // TODO: transfer the minimal bid amount from the bidder to the contract
             // note: could instead transfer the maximal bid amount: more security/incentive to participate but requires more funds
             // or average between the min and max bid ? --> maybe avoid staking 0 tokens when min bid is 0
-
+            self.strk_erc20_contract.read().transfer_from(sender, get_contract_address(), self.min_bid.read().into());
         }
 
         fn reveal_bid(ref self: ContractState, bid_amount: u32, user_salt: felt252) {
+            // Make sure user has not yet revealed their bid (to avoid adding them twice to the `revealers` vector)
+            let sender = get_caller_address();
+            let already_revealed = self.has_revealed.entry(sender).read();
+            assert(!already_revealed, super::errors::BID_ALREADY_REVEALED);
+
             self.make_sure_reveal_phase_is_ongoing();
 
             // Fetch the user's commitment
-            let sender = get_caller_address();
             let stored_commitment = self.commitments.entry(sender).read();
 
             // Compute the commitment from the revealed bid and salt
@@ -143,6 +186,10 @@ mod ZkAuction {
             let max_bid = self.max_bid.read();
             assert(bid_amount >= min_bid && bid_amount <= max_bid, super::errors::BID_OUT_OF_RANGE);
 
+            // Keep track of bidders who revealed their bid
+            self.revealers.append().write(sender);
+            self.has_revealed.entry(sender).write(true);
+
             // Update the highest bid and winner if this bid is the highest
             let current_highest_bid = self.highest_bid.read();
             if bid_amount > current_highest_bid {
@@ -151,30 +198,67 @@ mod ZkAuction {
             }
         }
 
-        fn reward_winner(ref self: ContractState) -> (Option<ContractAddress>, u32) {
+        fn reward_winner(ref self: ContractState) -> (ContractAddress, u32) {
             self.make_sure_reveal_phase_is_over();
             self.make_sure_winner_rewarded_only_once();
 
-            // make sure we do have a winner
+            // Make sure we do have a winner
             let winner = self.winner.read();
+            let highest_bid = self.highest_bid.read();
+
             assert(winner.is_some(), super::errors::NO_WINNER);
+            let winner = winner.unwrap();
 
-            // TODO: transfer funds from winner to contract - already staked insurance (during bid phase)
+            // Transfer funds from winner to contract minus already staked insurance (during bidding phase)
+            self.strk_erc20_contract.read().transfer_from(
+                winner,
+                get_contract_address(),
+                highest_bid.into() - self.min_bid.read().into()
+            );
 
-            // mint an NFT to reward the winner
+            // Mint an NFT to reward the winner
             let total_supply = self.erc721_total_supply.read();
-            self.erc721.safe_mint(winner.unwrap(), total_supply, array![].span());
+            self.erc721.safe_mint(winner, total_supply, array![].span());
             self.erc721_total_supply.write(total_supply + 1);
 
-            // TODO: release all staked funds to participants
+            // Release all staked funds to revealers except for winner
+            for i in 0..self.revealers.len() {
+                let revealer = self.revealers.at(i).read();
+                if revealer != winner {
+                    self.strk_erc20_contract.read().transfer(revealer, self.min_bid.read().into());
+                }
+            };
 
-            let highest_bid = self.highest_bid.read();
             (winner, highest_bid)
         }
 
+        // TODO: Allow bidders that have not revealed their bid to withdraw it
+        // only after a long period of time to mitigate/avoid this behaviour and encourage them to reveal their bid!
         fn withdraw_funds(ref self: ContractState) {
-            // TODO: Allow bid participants that have not revealed their bid to withdraw it
-            // only after a long period of time to mitigate/avoid this behaviour and encourage them to reveal their bid!
+            // Make sure withdrawal time has been reached
+            assert(
+                get_block_timestamp() >= self.reveal_finishes_at.read() + WITHDRAWAL_TIME,
+                super::errors::WITHDRAWAL_TIME_NOT_REACHED
+            );
+
+            // Make sure user has placed a bid and not revealed it
+            let requester = get_caller_address();
+            assert(self.commitments.entry(requester).read() != 0, super::errors::NOT_BIDDER);
+            assert(!self.has_revealed.entry(requester).read(), super::errors::HAS_REVEALED);
+
+            // Make sure user has not withdrawn yet
+            assert(!self.has_withdrawn.entry(requester).read(), super::errors::ALREADY_WITHDRAWN);
+
+            self.strk_erc20_contract.read().transfer(requester, self.min_bid.read().into());
+            self.has_withdrawn.entry(requester).write(true);
+        }
+
+        fn get_min_bid(self: @ContractState) -> u32 {
+            self.min_bid.read()
+        }
+
+        fn get_max_bid(self: @ContractState) -> u32 {
+            self.max_bid.read()
         }
     }
 
