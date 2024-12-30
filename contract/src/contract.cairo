@@ -29,9 +29,9 @@ mod errors {
     pub const NULL_DURATION: felt252 = 'Duration must be > 0';
     pub const WRONG_COMMITMENT: felt252 = 'Bid & salt do not exist';
     pub const PROOF_NOT_VERIFIED: felt252 = 'Proof is not correct';
-    pub const AUCTION_OVER: felt252 = 'Auction is over';
+    pub const BIDDING_OVER: felt252 = 'Bidding phase is over';
     pub const NOT_REVEAL_PHASE: felt252 = 'Not reveal phase';
-    pub const REVEAL_ONGOING: felt252 = 'Reveal phase is still on going';
+    pub const AUCTION_ONGOING: felt252 = 'Auction still on going';
     pub const NO_WINNER: felt252 = 'No winner';
     pub const WINNER_ALREADY_REWARDED: felt252 = 'Winner already been rewarded';
     pub const BID_ALREADY_REVEALED: felt252 = 'Already revealed bid';
@@ -61,11 +61,10 @@ mod ZkAuction {
 
     #[abi(embed_v0)]
     impl ERC721MixinImpl = ERC721Component::ERC721MixinImpl<ContractState>;
-
     impl ERC721InternalImpl = ERC721Component::InternalImpl<ContractState>;
 
     const STRK_ERC20_ADDRESS: felt252 = 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d;
-    // Time to wait (in seconds) before being able to withdraw locked minimal bid
+    // Time to wait (in seconds) before being able to withdraw locked minimal bid (90 days)
     const WITHDRAWAL_TIME: u64 = 7776000;
 
     #[storage]
@@ -82,9 +81,10 @@ mod ZkAuction {
 
         min_bid: u32,
         max_bid: u32,
-        commitments: Map<ContractAddress, felt252>, // Maps user addresses to their commitments
+        // Maps user addresses to their commitments (bid hash)
+        commitments: Map<ContractAddress, felt252>,
 
-        // To make sure users can reveal and therefore be added to `revealers` only once
+        // To make sure users can reveal their bid and be added to `revealers` only once
         has_revealed: Map<ContractAddress, bool>,
         revealers: Vec<ContractAddress>,
 
@@ -93,12 +93,12 @@ mod ZkAuction {
 
         bid_finishes_at: u64,
         reveal_finishes_at: u64,
+
         highest_bid: u32,
         winner: Option<ContractAddress>,
         winner_already_rewarded: bool,
     }
 
-    // TODO: add events
     // TODO: add fct doc + clean code
     #[event]
     #[derive(Drop, starknet::Event)]
@@ -106,7 +106,30 @@ mod ZkAuction {
         #[flat]
         ERC721Event: ERC721Component::Event,
         #[flat]
-        SRC5Event: SRC5Component::Event
+        SRC5Event: SRC5Component::Event,
+        BidCommitted: BidCommitted,
+        BidRevealed: BidRevealed,
+        WinnerRewarded: WinnerRewarded,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct BidCommitted {
+        bid_proof: Span<felt252>,
+        bid_hash: felt252,
+        user: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct BidRevealed {
+        bid_amount: u32,
+        user_salt: felt252,
+        user: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct WinnerRewarded {
+        winner: ContractAddress,
+        highest_bid: u32,
     }
 
     #[constructor]
@@ -147,6 +170,11 @@ mod ZkAuction {
     #[abi(embed_v0)]
     impl ZkAuctionImpl of super::IZkAuction<ContractState> {
         // TODO: maybe take hash from proof public outputs instead of as another parameter
+        /// Allows user to commit a bid:
+        /// - the bid hash
+        /// - a proof attesting to the bid validity
+        /// A user can commit/replace their bid anytime they want within the commit period
+        /// A user commiting a bid transfers the minimal bid amount to provide an incentive to reveal their bid
         fn commit_bid(ref self: ContractState, bid_proof: Span<felt252>, bid_hash: felt252) {
             self.make_sure_bid_phase_is_ongoing();
 
@@ -156,21 +184,28 @@ mod ZkAuction {
 
             // If verification passed, store the commitment
             let sender = get_caller_address();
+            let commitment = self.commitments.entry(sender).read();
             self.commitments.entry(sender).write(bid_hash);
 
             // TODO: transfer the minimal bid amount from the bidder to the contract
             // note: could instead transfer the maximal bid amount: more security/incentive to participate but requires more funds
             // or average between the min and max bid ? --> maybe avoid staking 0 tokens when min bid is 0
-            self.strk_erc20_contract.read().transfer_from(sender, get_contract_address(), self.min_bid.read().into());
+            if commitment == 0 {
+                self.strk_erc20_contract.read().transfer_from(sender, get_contract_address(), self.min_bid.read().into());
+            }
+
+            self.emit(BidCommitted { bid_proof, bid_hash, user: sender });
         }
 
+        /// Allows a user to reveal their bid after the bidding phase (during the revealing phase)
+        /// Users can reveal only once (no need for further reveals)
         fn reveal_bid(ref self: ContractState, bid_amount: u32, user_salt: felt252) {
+            self.make_sure_reveal_phase_is_ongoing();
+
             // Make sure user has not yet revealed their bid (to avoid adding them twice to the `revealers` vector)
             let sender = get_caller_address();
             let already_revealed = self.has_revealed.entry(sender).read();
             assert(!already_revealed, super::errors::BID_ALREADY_REVEALED);
-
-            self.make_sure_reveal_phase_is_ongoing();
 
             // Fetch the user's commitment
             let stored_commitment = self.commitments.entry(sender).read();
@@ -186,7 +221,7 @@ mod ZkAuction {
             let max_bid = self.max_bid.read();
             assert(bid_amount >= min_bid && bid_amount <= max_bid, super::errors::BID_OUT_OF_RANGE);
 
-            // Keep track of bidders who revealed their bid
+            // Keep track of bidders who revealed their bid to reimburse participants when winner is elected
             self.revealers.append().write(sender);
             self.has_revealed.entry(sender).write(true);
 
@@ -196,18 +231,23 @@ mod ZkAuction {
                 self.highest_bid.write(bid_amount);
                 self.winner.write(Option::Some(sender));
             }
+
+            self.emit(BidRevealed { bid_amount, user_salt, user: sender });
         }
 
+        /// Allows to reward the winner that bid the highest with minting a NFT after the revealing phase
+        /// Reimburses participants that revealed their bid
+        /// Can be called only once and by anyone
         fn reward_winner(ref self: ContractState) -> (ContractAddress, u32) {
-            self.make_sure_reveal_phase_is_over();
+            self.make_sure_auction_is_over();
             self.make_sure_winner_rewarded_only_once();
 
             // Make sure we do have a winner
             let winner = self.winner.read();
-            let highest_bid = self.highest_bid.read();
-
             assert(winner.is_some(), super::errors::NO_WINNER);
             let winner = winner.unwrap();
+
+            let highest_bid = self.highest_bid.read();
 
             // Transfer funds from winner to contract minus already staked insurance (during bidding phase)
             self.strk_erc20_contract.read().transfer_from(
@@ -229,24 +269,22 @@ mod ZkAuction {
                 }
             };
 
+            self.emit(WinnerRewarded { winner, highest_bid });
+
             (winner, highest_bid)
         }
 
-        // TODO: Allow bidders that have not revealed their bid to withdraw it
-        // only after a long period of time to mitigate/avoid this behaviour and encourage them to reveal their bid!
+        /// Allow bidders that have not revealed their bid to withdraw their staked insurance
+        /// Can be called only once per user after the revealing phase + WITHDRAWAL_TIME
         fn withdraw_funds(ref self: ContractState) {
-            // Make sure withdrawal time has been reached
-            assert(
-                get_block_timestamp() >= self.reveal_finishes_at.read() + WITHDRAWAL_TIME,
-                super::errors::WITHDRAWAL_TIME_NOT_REACHED
-            );
+            self.make_sure_withdrawal_phase_is_open();
 
             // Make sure user has placed a bid and not revealed it
             let requester = get_caller_address();
             assert(self.commitments.entry(requester).read() != 0, super::errors::NOT_BIDDER);
             assert(!self.has_revealed.entry(requester).read(), super::errors::HAS_REVEALED);
 
-            // Make sure user has not withdrawn yet
+            // Make sure user has not already withdrawn
             assert(!self.has_withdrawn.entry(requester).read(), super::errors::ALREADY_WITHDRAWN);
 
             self.strk_erc20_contract.read().transfer(requester, self.min_bid.read().into());
@@ -266,7 +304,7 @@ mod ZkAuction {
     impl InternalImpl of InternalTrait {
         fn make_sure_bid_phase_is_ongoing(self: @ContractState) {
             let current_block_timestamp = get_block_timestamp();
-            assert(current_block_timestamp < self.bid_finishes_at.read(), super::errors::AUCTION_OVER);
+            assert(current_block_timestamp < self.bid_finishes_at.read(), super::errors::BIDDING_OVER);
         }
 
         fn make_sure_reveal_phase_is_ongoing(self: @ContractState) {
@@ -278,14 +316,22 @@ mod ZkAuction {
             );
         }
 
-        fn make_sure_reveal_phase_is_over(self: @ContractState) {
+        fn make_sure_auction_is_over(self: @ContractState) {
             let current_block_timestamp = get_block_timestamp();
-            assert(current_block_timestamp >= self.reveal_finishes_at.read(), super::errors::REVEAL_ONGOING);
+            assert(current_block_timestamp >= self.reveal_finishes_at.read(), super::errors::AUCTION_ONGOING);
         }
 
         fn make_sure_winner_rewarded_only_once(ref self: ContractState) {
             assert(!self.winner_already_rewarded.read(), super::errors::WINNER_ALREADY_REWARDED);
             self.winner_already_rewarded.write(true);
+        }
+
+        fn make_sure_withdrawal_phase_is_open(self: @ContractState) {
+            let current_block_timestamp = get_block_timestamp();
+            assert(
+                current_block_timestamp >= self.reveal_finishes_at.read() + WITHDRAWAL_TIME,
+                super::errors::WITHDRAWAL_TIME_NOT_REACHED
+            );
         }
     }
 }
